@@ -1,37 +1,31 @@
-from typing import Iterable, Optional, Type
-
 import torch
 import torch.nn as nn
 
 
-class WorldModelPhysicsHybrid(nn.Module):
+class WorldModelPhysicsSymbolic(nn.Module):
     """
-    Hybrid symbolic + learned world model for InvertedDoublePendulum-v4.
+    A physics-informed world model for the InvertedDoublePendulum-v4 environment using Lagrangian mechanics.
 
-    Inputs/outputs are identical to the vanilla MLP world model:
-    - forward(observation, action) -> next_observation
-      where observation has shape (..., 11) and action has shape (..., 1).
+    This model implements a learnable physics-based approach:
+    - Uses exact physical equations derived from Lagrangian mechanics
+    - All parameters (masses, lengths, inertias, damping, etc.) are LEARNABLE via gradient descent
+    - Predicts next state using physical laws with learnable constants
+    - Can fit true physical parameters from observed dynamics data
 
-    Observation layout (per Gymnasium docs):
-      [x, sin(theta1), sin(theta2), cos(theta1), cos(theta2),
-       x_dot, theta1_dot, theta2_dot, cfrc_1, cfrc_2, cfrc_3]
+    State Representation:
+        Observation vector [11]:
+            [0] x: Cart position
+            [1-4] Angles: [sin(θ1), sin(θ2_rel), cos(θ1), cos(θ2_rel)]
+            [5-7] Velocities: [x_dot, θ1_dot, θ2_rel_dot]
+            [8-10] Contact forces: [cfrc_1, cfrc_2, cfrc_3]
 
-    Model structure:
-      1) Reconstruct angles (theta1, theta2) from sin/cos using atan2.
-      2) Compute accelerations [x_ddot, theta1_ddot, theta2_ddot] using a
-         physics-inspired basis (sin/cos terms, couplings, damping, action),
-         parameterized by a small linear map with learnable coefficients. This
-         encodes physical priors (periodicity, gravity-like terms, damping).
-      3) Optionally add a learned residual on accelerations via a shallow MLP,
-         gated by a scalar computed from features.
-      4) Semi-implicit Euler integrate to obtain next generalized coordinates
-         and velocities, then convert to the 11-D observation format.
-      5) Predict the 3 constraint forces with a lightweight linear head.
+        Where:
+            - θ2_rel: Relative angle of second link relative to first link
+            - θ2_abs = θ1 + θ2_rel: Absolute angle of second link
 
-    Notes:
-      - dt is configurable; defaults to 0.02s.
-      - Parameters are initialized with conservative magnitudes to ensure
-        stability before learning.
+    Control:
+        - Single action: Horizontal force applied to cart (Newtons)
+        - Force is scaled by force_scale parameter
     """
 
     def __init__(
@@ -39,206 +33,351 @@ class WorldModelPhysicsHybrid(nn.Module):
         obs_dim: int = 11,
         action_dim: int = 1,
         dt: float = 0.02,
-        use_residual: bool = True,
-        residual_hidden_dims: Optional[Iterable[int]] = (8,),
-        activation: Type[nn.Module] = nn.Tanh,
+        # Physical constants (defaults are reasonable placeholders)
+        mass_cart: float = 1.0,
+        mass_link1: float = 0.1,
+        mass_link2: float = 0.1,
+        length_link1: float = 0.5,
+        # length_link2 removed - not needed for dynamics (only lc2 matters)
+        com_link1: float = 0.25,  # distance to COM from joint
+        com_link2: float = 0.25,
+        inertia_link1: float = 0.002,
+        inertia_link2: float = 0.002,
+        gravity: float = 9.81,
+        # Linear damping (non-conservative generalized forces)
+        cart_damping: float = 0.0,
+        joint1_damping: float = 0.0,
+        joint2_damping: float = 0.0,
+        force_scale: float = 1.0,  # action to force scaling
     ) -> None:
         super().__init__()
 
         if obs_dim != 11 or action_dim != 1:
             raise ValueError(
-                "WorldModelPhysicsHybrid is configured for InvertedDoublePendulum-v4 with obs_dim=11 and action_dim=1."
+                "WorldModelPhysicsSymbolic is configured for InvertedDoublePendulum-v4 with obs_dim=11 and action_dim=1."
             )
 
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.dt = float(dt)
-        self.use_residual = bool(use_residual)
 
-        # Learnable physical scalings and constants
-        # Action gain (force scaling), gravity, and simple viscous damping
-        self.action_gain = nn.Parameter(torch.tensor(10.0))  # N per unit action
-        self.gravity = nn.Parameter(torch.tensor(9.81))  # m/s^2
-        self.cart_damping = nn.Parameter(torch.tensor(0.05))
-        self.theta1_damping = nn.Parameter(torch.tensor(0.02))
-        self.theta2_damping = nn.Parameter(torch.tensor(0.02))
+        # Register physical constants as LEARNABLE parameters
+        # These will be optimized via gradient descent during training
+        self.m_c = nn.Parameter(torch.tensor(float(mass_cart)))
+        self.m1 = nn.Parameter(torch.tensor(float(mass_link1)))
+        self.m2 = nn.Parameter(torch.tensor(float(mass_link2)))
+        self.l1 = nn.Parameter(torch.tensor(float(length_link1)))
+        # l2 removed - not needed (only lc2 is used in physics equations)
+        self.lc1 = nn.Parameter(torch.tensor(float(com_link1)))
+        self.lc2 = nn.Parameter(torch.tensor(float(com_link2)))
+        self.I1 = nn.Parameter(torch.tensor(float(inertia_link1)))
+        self.I2 = nn.Parameter(torch.tensor(float(inertia_link2)))
+        self.g = nn.Parameter(torch.tensor(float(gravity)))
+        self.b_x = nn.Parameter(torch.tensor(float(cart_damping)))
+        self.b1 = nn.Parameter(torch.tensor(float(joint1_damping)))
+        self.b2 = nn.Parameter(torch.tensor(float(joint2_damping)))
+        self.force_scale = nn.Parameter(torch.tensor(float(force_scale)))
 
-        # Physics-inspired basis mapping to accelerations
-        # Feature vector phi(s, a) encodes periodic and coupling structure
-        # Reduced basis (11 dims): [1, a, x_dot, th1_dot, th2_dot, sin th1, sin th2, cos th1, cos th2, sin(th1-th2), cos(th1-th2)]
-        self._phi_dim = 11
-        self._phi_scale = nn.Parameter(torch.ones(self._phi_dim))  # per-feature scaling
-        self._accel_head = nn.Linear(self._phi_dim, 3, bias=True)
-        self._init_accel_head()
+    def get_learned_parameters(self) -> dict:
+        """
+        Returns a dictionary of the current learned physical parameters.
 
-        # Optional residual MLP that predicts accel corrections d[xddot, th1ddot, th2ddot]
-        if self.use_residual:
-            in_dim = self.obs_dim + self.action_dim
-            layers = []
-            prev = in_dim
-            if residual_hidden_dims and len(tuple(residual_hidden_dims)) > 0:
-                for h in residual_hidden_dims:
-                    layers.append(nn.Linear(prev, h))
-                    layers.append(activation())
-                    prev = h
-            layers.append(nn.Linear(prev, 3))
-            self._residual = nn.Sequential(*layers)
-            # Scalar gate for the residual based on features
-            self._residual_gate = nn.Linear(self._phi_dim, 1)
-        else:
-            self._residual = None
-            self._residual_gate = None
+        Returns:
+            Dictionary with parameter names and their current values as Python floats.
+        """
+        return {
+            "mass_cart": float(self.m_c.item()),
+            "mass_link1": float(self.m1.item()),
+            "mass_link2": float(self.m2.item()),
+            "length_link1": float(self.l1.item()),
+            # length_link2 removed - not used in physics
+            "com_link1": float(self.lc1.item()),
+            "com_link2": float(self.lc2.item()),
+            "inertia_link1": float(self.I1.item()),
+            "inertia_link2": float(self.I2.item()),
+            "gravity": float(self.g.item()),
+            "cart_damping": float(self.b_x.item()),
+            "joint1_damping": float(self.b1.item()),
+            "joint2_damping": float(self.b2.item()),
+            "force_scale": float(self.force_scale.item()),
+        }
 
-        # Head for constraint force prediction (3 values)
-        # Lightweight linear map over [phi, accelerations]
-        self._cfrc_head = nn.Linear(self._phi_dim + 3, 3)
-
-    def _init_accel_head(self) -> None:
-        # Initialize to encode weak gravity and small couplings, stable to start
-        nn.init.zeros_(self._accel_head.weight)
-        nn.init.zeros_(self._accel_head.bias)
-        # Indices in phi for convenience for reduced basis
-        SIN_TH1 = 5
-        SIN_TH2 = 6
-        # Encourage gravity-like behavior initially on angular accelerations
-        with torch.no_grad():
-            # theta1_ddot ~ -g * sin(theta1)
-            self._accel_head.weight[1, SIN_TH1] = -self.gravity.item()
-            # theta2_ddot ~ -g * sin(theta2)
-            self._accel_head.weight[2, SIN_TH2] = -0.5 * self.gravity.item()
-            # Leave cart x_ddot near 0 initially (will learn from data)
+    def print_learned_parameters(self) -> None:
+        """
+        Prints the current learned physical parameters in a readable format.
+        """
+        params = self.get_learned_parameters()
+        print("\nLearned Physical Parameters:")
+        print("=" * 50)
+        print(f"  Cart mass (m_c):       {params['mass_cart']:.6f} kg")
+        print(f"  Link 1 mass (m1):      {params['mass_link1']:.6f} kg")
+        print(f"  Link 2 mass (m2):      {params['mass_link2']:.6f} kg")
+        print(f"  Link 1 length (l1):    {params['length_link1']:.6f} m")
+        # Link 2 length (l2) removed - not used in physics calculations
+        print(f"  Link 1 COM (lc1):      {params['com_link1']:.6f} m")
+        print(f"  Link 2 COM (lc2):      {params['com_link2']:.6f} m")
+        print(f"  Link 1 inertia (I1):   {params['inertia_link1']:.6f} kg⋅m²")
+        print(f"  Link 2 inertia (I2):   {params['inertia_link2']:.6f} kg⋅m²")
+        print(f"  Gravity (g):           {params['gravity']:.6f} m/s²")
+        print(f"  Cart damping (b_x):    {params['cart_damping']:.6f} N⋅s/m")
+        print(f"  Joint 1 damping (b1):  {params['joint1_damping']:.6f} N⋅m⋅s")
+        print(f"  Joint 2 damping (b2):  {params['joint2_damping']:.6f} N⋅m⋅s")
+        print(f"  Force scale:           {params['force_scale']:.6f}")
+        print("=" * 50)
 
     @staticmethod
     def _split_observation(obs_flat: torch.Tensor):
+        """
+        Splits flattened observation tensor into individual components.
+
+        Args:
+            obs_flat: Batch of observations [B, 11]
+
+        Returns:
+            Tuple of tensors:
+                - Cart position (x)
+                - Link angles (sin/cos θ1, sin/cos θ2_rel)
+                - Velocities (x_dot, θ1_dot, θ2_rel_dot)
+                - Contact forces (cfrc)
+        """
         x = obs_flat[:, 0:1]
         sin_th1 = obs_flat[:, 1:2]
-        sin_th2 = obs_flat[:, 2:3]
+        sin_th2_rel = obs_flat[:, 2:3]
         cos_th1 = obs_flat[:, 3:4]
-        cos_th2 = obs_flat[:, 4:5]
+        cos_th2_rel = obs_flat[:, 4:5]
         x_dot = obs_flat[:, 5:6]
         th1_dot = obs_flat[:, 6:7]
-        th2_dot = obs_flat[:, 7:8]
+        th2_rel_dot = obs_flat[:, 7:8]
         cfrc = obs_flat[:, 8:11]
-        return x, sin_th1, sin_th2, cos_th1, cos_th2, x_dot, th1_dot, th2_dot, cfrc
+        return (
+            x,
+            sin_th1,
+            sin_th2_rel,
+            cos_th1,
+            cos_th2_rel,
+            x_dot,
+            th1_dot,
+            th2_rel_dot,
+            cfrc,
+        )
 
     @staticmethod
     def _angles_from_sin_cos(s: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Converts sine and cosine components back to angles using atan2.
+
+        Args:
+            s: Sine component of angle
+            c: Cosine component of angle
+
+        Returns:
+            Angle in radians in range [-π, π]
+        """
         return torch.atan2(s, c)
 
-    def _build_phi(
-        self,
-        x: torch.Tensor,
-        sin_th1: torch.Tensor,
-        sin_th2: torch.Tensor,
-        cos_th1: torch.Tensor,
-        cos_th2: torch.Tensor,
-        x_dot: torch.Tensor,
-        th1_dot: torch.Tensor,
-        th2_dot: torch.Tensor,
-        action: torch.Tensor,
-    ) -> torch.Tensor:
-        th1 = self._angles_from_sin_cos(sin_th1, cos_th1)
-        th2 = self._angles_from_sin_cos(sin_th2, cos_th2)  # relative angle
-        th12 = th1 - th2
+    def _lagrangian(self, q: torch.Tensor, qdot: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the Lagrangian (L = T - V) for the double pendulum system.
 
-        a = action * self.action_gain
+        Implements the full Lagrangian mechanics for a cart with double pendulum:
+        - Kinetic energy (T) includes cart, both links' COM motion and angular velocity
+        - Potential energy (V) accounts for gravitational potential of both links
 
-        # Reduced physics-informed features (11 dims)
-        phi_list = [
-            torch.ones_like(x),  # 0: bias
-            a,  # 1: action force (scaled)
-            x_dot,  # 2: cart velocity (damping)
-            th1_dot,  # 3: theta1 velocity
-            th2_dot,  # 4: theta2 velocity
-            sin_th1,  # 5: sin(theta1)
-            sin_th2,  # 6: sin(theta2)
-            cos_th1,  # 7: cos(theta1)
-            cos_th2,  # 8: cos(theta2)
-            torch.sin(th12),  # 9: sin(theta1 - theta2)
-            torch.cos(th12),  # 10: cos(theta1 - theta2)
-        ]
-        phi = torch.cat(phi_list, dim=-1)
-        # Per-feature learnable scaling
-        phi = phi * self._phi_scale
-        return phi
+        Args:
+            q: Generalized coordinates [B, 3] = [x, θ1, θ2_rel]
+            qdot: Generalized velocities [B, 3] = [x_dot, θ1_dot, θ2_rel_dot]
 
-    def _predict_accelerations(
-        self,
-        obs_flat: torch.Tensor,
-        action_flat: torch.Tensor,
-    ) -> torch.Tensor:
-        x, s1, s2, c1, c2, x_dot, th1_dot, th2_dot, _ = self._split_observation(
-            obs_flat
+        Returns:
+            Lagrangian value for each batch element [B]
+        """
+        # Extract angles and velocities
+        th1 = q[:, 1:2]
+        th2_rel = q[:, 2:3]
+        th2_abs = th1 + th2_rel
+
+        xdot = qdot[:, 0:1]
+        th1dot = qdot[:, 1:2]
+        th2_reldot = qdot[:, 2:3]
+        th2_absdot = th1dot + th2_reldot
+
+        # Precompute trigonometric functions
+        cos_th1 = torch.cos(th1)
+        sin_th1 = torch.sin(th1)
+        cos_th2_abs = torch.cos(th2_abs)
+        sin_th2_abs = torch.sin(th2_abs)
+
+        # Kinematics: COM linear velocities (planar, y up)
+        x1dot = xdot + self.lc1 * cos_th1 * th1dot
+        y1dot = -self.lc1 * sin_th1 * th1dot
+
+        x2dot = xdot + self.l1 * cos_th1 * th1dot + self.lc2 * cos_th2_abs * th2_absdot
+        y2dot = -self.l1 * sin_th1 * th1dot - self.lc2 * sin_th2_abs * th2_absdot
+
+        # Kinetic energy
+        T_cart = 0.5 * self.m_c * xdot.pow(2)
+        T1 = 0.5 * self.m1 * (x1dot.pow(2) + y1dot.pow(2)) + 0.5 * self.I1 * th1dot.pow(
+            2
         )
-        phi = self._build_phi(x, s1, s2, c1, c2, x_dot, th1_dot, th2_dot, action_flat)
-        acc_base = self._accel_head(phi)
+        T2 = 0.5 * self.m2 * (
+            x2dot.pow(2) + y2dot.pow(2)
+        ) + 0.5 * self.I2 * th2_absdot.pow(2)
+        T = T_cart + T1 + T2
 
-        # Add simple viscous damping explicitly to accelerations
-        # acc_base[:, 0] -> x_ddot, acc_base[:, 1] -> th1_ddot, acc_base[:, 2] -> th2_ddot
-        acc_base = acc_base.clone()
-        acc_base[:, 0:1] = acc_base[:, 0:1] - self.cart_damping * x_dot
-        acc_base[:, 1:2] = acc_base[:, 1:2] - self.theta1_damping * th1_dot
-        acc_base[:, 2 : 2 + 1] = acc_base[:, 2 : 2 + 1] - self.theta2_damping * th2_dot
+        # Potential energy (y up)
+        y1 = self.lc1 * cos_th1
+        y2 = self.l1 * cos_th1 + self.lc2 * cos_th2_abs
+        V = self.m1 * self.g * y1 + self.m2 * self.g * y2
 
-        if self._residual is not None:
-            accel_res = self._residual(torch.cat([obs_flat, action_flat], dim=-1))
-            # Scalar gate based on features
-            g = torch.sigmoid(self._residual_gate(phi))  # shape (B,1)
-            acc = acc_base + g * accel_res
-        else:
-            acc = acc_base
-        return acc  # shape: (B, 3)
+        L = T - V
+        return L.squeeze(-1)  # [B, 1] -> [B]
 
-    def _integrate(
-        self,
-        obs_flat: torch.Tensor,
-        acc: torch.Tensor,
+    def _compute_qdd(
+        self, q: torch.Tensor, qdot: torch.Tensor, force: torch.Tensor
     ) -> torch.Tensor:
-        x, s1, s2, c1, c2, x_dot, th1_dot, th2_dot, _ = self._split_observation(
-            obs_flat
+        """
+        Computes generalized accelerations using the Euler-Lagrange equations.
+
+        Solves the equation of motion:
+            M(q) qdd + h(q, qdot) = Q
+        where:
+            - M(q): Mass/inertia matrix
+            - h: Coriolis, centrifugal, and gravity terms
+            - Q: Applied forces (cart force + damping)
+
+        Uses automatic differentiation to compute:
+            - Mass matrix M = ∂²L/∂qdot²
+            - h = d/dq(∂L/∂qdot) qdot - ∂L/∂q
+
+        Args:
+            q: Generalized coordinates [B, 3]
+            qdot: Generalized velocities [B, 3]
+            force: Applied cart force [B, 1]
+
+        Returns:
+            Generalized accelerations qdd [B, 3]
+        """
+        # Enable gradients for physics computations even if in no_grad context
+        # (needed for validation/evaluation when model.eval() and torch.no_grad() are active)
+        with torch.enable_grad():
+            # Ensure q, qdot require gradients for autograd-based Lagrangian calculus
+            q_req = q.detach().requires_grad_(True)
+            qdot_req = qdot.detach().requires_grad_(True)
+
+            L = self._lagrangian(q_req, qdot_req)  # [B]
+
+            # Compute gradients of Lagrangian
+            dLdq = torch.autograd.grad(L.sum(), q_req, create_graph=True)[0]  # [B, 3]
+            dLdqdot = torch.autograd.grad(L.sum(), qdot_req, create_graph=True)[
+                0
+            ]  # [B, 3]
+
+            # Mass matrix M_ij = ∂/∂qdot_j (∂L/∂qdot_i)
+            M_rows = []
+            for i in range(3):
+                grad_i = torch.autograd.grad(
+                    dLdqdot[:, i].sum(), qdot_req, retain_graph=True, create_graph=True
+                )[0]
+                M_rows.append(grad_i.unsqueeze(1))  # [B, 1, 3]
+            M = torch.cat(M_rows, dim=1)  # [B, 3, 3]
+
+            # A_ij = ∂/∂q_j (∂L/∂qdot_i)
+            A_rows = []
+            for i in range(3):
+                grad_i = torch.autograd.grad(
+                    dLdqdot[:, i].sum(), q_req, retain_graph=True, create_graph=True
+                )[0]
+                A_rows.append(grad_i.unsqueeze(1))  # [B, 1, 3]
+            A = torch.cat(A_rows, dim=1)  # [B, 3, 3]
+
+            # Coriolis, centrifugal, and gravity terms: h = A(q,qdot) @ qdot - dLdq
+            h = torch.bmm(A, qdot_req.unsqueeze(-1)).squeeze(-1) - dLdq  # [B, 3]
+
+        # Generalized forces Q: applied force on cart DOF + viscous damping
+        Q = torch.zeros_like(q)  # [B, 3]
+        Q[:, 0:1] = force - self.b_x * qdot[:, 0:1]  # Cart: applied force - damping
+        Q[:, 1:2] = -self.b1 * qdot[:, 1:2]  # Joint 1: damping only
+        Q[:, 2:3] = -self.b2 * qdot[:, 2:3]  # Joint 2: damping only
+
+        # Solve M qdd = Q - h for accelerations
+        rhs = Q - h  # [B, 3]
+        qdd = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)  # [B, 3]
+        return qdd
+
+    def _integrate(self, obs_flat: torch.Tensor, qdd: torch.Tensor) -> torch.Tensor:
+        """
+        Performs semi-implicit Euler integration to compute next state.
+
+        Integration scheme:
+            1. Update velocities using accelerations (implicit)
+            2. Update positions using new velocities (explicit)
+            3. Convert angles back to sin/cos representation
+
+        Args:
+            obs_flat: Current flattened observation [B, 11]
+            qdd: Computed accelerations [B, 3]
+
+        Returns:
+            Next observation (without contact forces) [B, 8]
+        """
+        x, s1, s2_rel, c1, c2_rel, x_dot, th1_dot, th2_rel_dot, _ = (
+            self._split_observation(obs_flat)
         )
 
         th1 = self._angles_from_sin_cos(s1, c1)
-        th2 = self._angles_from_sin_cos(s2, c2)
+        th2_rel = self._angles_from_sin_cos(s2_rel, c2_rel)
 
-        x_ddot = acc[:, 0:1]
-        th1_ddot = acc[:, 1:2]
-        th2_ddot = acc[:, 2:3]
+        x_ddot = qdd[:, 0:1]
+        th1_ddot = qdd[:, 1:2]
+        th2_rel_ddot = qdd[:, 2:3]
 
-        # Semi-implicit (symplectic) Euler for better stability
+        # Semi-implicit Euler
         x_dot_next = x_dot + self.dt * x_ddot
         th1_dot_next = th1_dot + self.dt * th1_ddot
-        th2_dot_next = th2_dot + self.dt * th2_ddot
+        th2_rel_dot_next = th2_rel_dot + self.dt * th2_rel_ddot
 
         x_next = x + self.dt * x_dot_next
         th1_next = th1 + self.dt * th1_dot_next
-        th2_next = th2 + self.dt * th2_dot_next
+        th2_rel_next = th2_rel + self.dt * th2_rel_dot_next
 
         s1_next = torch.sin(th1_next)
         c1_next = torch.cos(th1_next)
-        s2_next = torch.sin(th2_next)
-        c2_next = torch.cos(th2_next)
+        s2_rel_next = torch.sin(th2_rel_next)
+        c2_rel_next = torch.cos(th2_rel_next)
 
-        # Assemble next observation without constraint forces
         next_obs_wo_cfrc = torch.cat(
             [
                 x_next,
                 s1_next,
-                s2_next,
+                s2_rel_next,
                 c1_next,
-                c2_next,
+                c2_rel_next,
                 x_dot_next,
                 th1_dot_next,
-                th2_dot_next,
+                th2_rel_dot_next,
             ],
             dim=-1,
         )
         return next_obs_wo_cfrc
 
-    def _predict_cfrc(self, phi: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
-        return self._cfrc_head(torch.cat([phi, acc], dim=-1))
-
     def forward(self, observation: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Predicts next observation given current observation and action.
+
+        Prediction steps:
+            1. Extract state variables from observation
+            2. Convert sin/cos to angles
+            3. Compute accelerations using Lagrangian mechanics
+            4. Integrate state forward in time
+            5. Set contact forces to zero (not modeled)
+
+        Args:
+            observation: Current observation [..., 11]
+            action: Applied force [..., 1]
+
+        Returns:
+            Predicted next observation [..., 11]
+        """
+        # Input validation
         if observation.ndim < 2 or action.ndim < 2:
             raise ValueError(
                 "Both observation and action must be at least 2D tensors: (..., dim)."
@@ -256,21 +395,36 @@ class WorldModelPhysicsHybrid(nn.Module):
                 f"Expected action last dim {self.action_dim}, got {action.shape[-1]}."
             )
 
+        # Flatten to batch dimension for processing
         leading_shape = observation.shape[:-1]
         obs_flat = observation.reshape(-1, self.obs_dim)
         act_flat = action.reshape(-1, self.action_dim)
 
-        # Build features once for heads that need them
-        x, s1, s2, c1, c2, x_dot, th1_dot, th2_dot, _ = self._split_observation(
-            obs_flat
+        # Extract and reconstruct state variables
+        x, s1, s2_rel, c1, c2_rel, x_dot, th1_dot, th2_rel_dot, _ = (
+            self._split_observation(obs_flat)
         )
-        phi = self._build_phi(x, s1, s2, c1, c2, x_dot, th1_dot, th2_dot, act_flat)
+        th1 = self._angles_from_sin_cos(s1, c1)
+        th2_rel = self._angles_from_sin_cos(s2_rel, c2_rel)
 
-        acc = self._predict_accelerations(obs_flat, act_flat)
-        next_obs_wo_cfrc = self._integrate(obs_flat, acc)
-        cfrc_next = self._predict_cfrc(phi, acc)
+        # Build generalized coordinates and velocities
+        q = torch.cat([x, th1, th2_rel], dim=-1)  # [B, 3]
+        qdot = torch.cat([x_dot, th1_dot, th2_rel_dot], dim=-1)  # [B, 3]
 
-        next_obs = torch.cat([next_obs_wo_cfrc, cfrc_next], dim=-1)
+        # Scale action to force
+        force = self.force_scale * act_flat  # [B, 1]
+
+        # Compute accelerations and integrate
+        qdd = self._compute_qdd(q, qdot, force)
+        next_obs_wo_cfrc = self._integrate(obs_flat, qdd)
+
+        # Contact forces are not modeled symbolically → set to zero
+        zeros_cfrc = torch.zeros(
+            obs_flat.shape[0], 3, device=obs_flat.device, dtype=obs_flat.dtype
+        )
+        next_obs = torch.cat([next_obs_wo_cfrc, zeros_cfrc], dim=-1)
+
+        # Reshape back to original leading dimensions
         next_obs = next_obs.reshape(*leading_shape, self.obs_dim)
         return next_obs
 
@@ -283,15 +437,27 @@ class WorldModelPhysicsHybrid(nn.Module):
         cfrc_weight: float = 0.1,
     ) -> torch.Tensor:
         """
-        Standard MSE loss to the target next observation with a lower weight for
-        constraint forces to reduce their dominance.
+        Computes prediction error between model output and target next state.
+
+        Loss components:
+            - Main state error: MSE over positions and velocities
+            - Contact force error: Weighted MSE over contact forces
+
+        Args:
+            observation: Current observation
+            action: Applied action
+            target_next_observation: True next observation
+            loss_reduction: Reduction method for batch ("mean", "sum", "none")
+            cfrc_weight: Weight for contact force prediction error
+
+        Returns:
+            Scalar loss if reduction is "mean"/"sum", else per-sample losses
         """
         pred = self.forward(observation, action)
         if pred.shape != target_next_observation.shape:
             raise ValueError(
                 f"Target shape {target_next_observation.shape} must match predictions {pred.shape}."
             )
-        # Down-weight cfrc components (last 3 dims)
         err = pred - target_next_observation
         state_err = err[..., :8]
         cfrc_err = err[..., 8:]

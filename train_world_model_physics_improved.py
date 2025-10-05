@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Train a physics-informed world model (WorldModelPhysicsSymbolic) that predicts next observation from (observation, action).
+Train the improved physics-informed world model with better stability and performance.
 
-This script trains a model that uses Lagrangian mechanics with LEARNABLE physical parameters.
-The model learns the true physical constants (masses, lengths, inertias, damping, etc.) from data
-by minimizing prediction error via gradient descent.
-
-- Supports loading a single .pt buffer or multiple buffers (files or a directory)
-- Handles episodic TensorDict buffers by aligning (obs_t, action_t) -> obs_{t+1}
-- Uses the model's compute_loss with configurable constraint force weighting
-- Learns physical parameters via backpropagation
-- Reports learned parameters at the end of training
+Key improvements:
+- Parameter constraints for physical validity
+- Analytical mass matrix computation
+- RK4 integration option
+- Gradient clipping
+- Better learning rate scheduling
+- Parameter regularization
 """
 
 import argparse
+import sys
+from pathlib import Path
 from typing import List, Tuple
 
 import torch
@@ -22,25 +22,19 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-# Try imports regardless of execution location
-try:
-    from MLP.physical_world_model.world_model_with_physics import (
-        WorldModelPhysicsSymbolic,
-    )
-except Exception:
-    from MLP.physical_world_model.world_model_with_physics import (
-        WorldModelPhysicsSymbolic,
-    )
+# Add workspace root to Python path
+workspace_root = Path(__file__).resolve().parents[2]
+if str(workspace_root) not in sys.path:
+    sys.path.insert(0, str(workspace_root))
 
-from utils import (
+from MLP.physical_world_model.world_model_with_physics_improved import (
+    WorldModelPhysicsSymbolicImproved,
+)
+from MLP.utils import (
     load_single_buffer,
     load_multiple_buffers,
     process_buffer_for_world_model,
 )
-
-# -------------------------
-# DataLoader Utilities
-# -------------------------
 
 
 def create_dataloaders(
@@ -72,54 +66,54 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
-# -------------------------
-# Metrics & Evaluation
-# -------------------------
-
-
 def compute_batch_accuracy(
-    pred: torch.Tensor, target: torch.Tensor, tol: float
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    tol: float,
+    normalization_std: torch.Tensor = None,
 ) -> float:
     """
-    Compute accuracy for regression as the fraction of samples whose mean percentage
-    error per dimension is below a tolerance threshold.
+    Compute accuracy as fraction of samples with mean normalized error <= tol.
 
-    Args:
-        pred: Predicted values [batch_size, dim]
-        target: Target values [batch_size, dim]
-        tol: Tolerance threshold for mean percentage error
-
-    Returns:
-        Fraction of samples with mean percentage error <= tol
+    Normalized error = |pred - target| / std_dev(dimension)
+    This makes errors comparable across dimensions with different units/scales.
     """
     if pred.shape != target.shape:
         raise ValueError(
             f"Prediction/target shape mismatch: {pred.shape} vs {target.shape}"
         )
-    # Calculate percentage difference per element: |pred - target| / |target|
-    # Add small epsilon to avoid division by zero
-    percentage_diff_per_element = torch.abs(pred - target) / (torch.abs(target) + 1e-8)
-    # Mean percentage difference per sample
-    mae_per_sample = percentage_diff_per_element.mean(dim=-1)
+
+    abs_diff_per_element = torch.abs(pred - target)
+
+    if normalization_std is not None:
+        # BUGFIX: Ensure normalization_std is on the same device as predictions
+        if normalization_std.device != pred.device:
+            normalization_std = normalization_std.to(pred.device)
+        # Use a more robust normalization: for dimensions with very low variance,
+        # use absolute error instead of normalized error to avoid division by near-zero
+        # Threshold: if std < 0.01, consider the dimension as near-constant
+        min_std_threshold = 0.01
+        robust_std = torch.maximum(
+            normalization_std,
+            torch.tensor(min_std_threshold, device=normalization_std.device),
+        )
+        normalized_diff = abs_diff_per_element / robust_std
+    else:
+        normalized_diff = abs_diff_per_element
+
+    mae_per_sample = normalized_diff.mean(dim=-1)
     correct = (mae_per_sample <= tol).float()
     return float(correct.mean().item())
 
 
 def evaluate_loader(
-    model: nn.Module, loader: DataLoader, device: str, tol: float
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    tol: float,
+    normalization_std: torch.Tensor = None,
 ) -> Tuple[float, float]:
-    """
-    Evaluate model on a data loader.
-
-    Args:
-        model: World model to evaluate
-        loader: DataLoader with (obs, action, next_obs) batches
-        device: Device to run evaluation on
-        tol: Tolerance for accuracy computation
-
-    Returns:
-        Tuple of (average_mse, average_accuracy)
-    """
+    """Evaluate model on a data loader."""
     model.eval()
     criterion = nn.MSELoss(reduction="mean")
     total_loss = 0.0
@@ -134,7 +128,9 @@ def evaluate_loader(
 
             pred_next = model(obs_batch, act_batch)
             loss = criterion(pred_next, next_obs_batch)
-            acc = compute_batch_accuracy(pred_next, next_obs_batch, tol)
+            acc = compute_batch_accuracy(
+                pred_next, next_obs_batch, tol, normalization_std
+            )
 
             total_loss += float(loss.item())
             total_acc += float(acc)
@@ -145,15 +141,11 @@ def evaluate_loader(
     return avg_mse, avg_acc
 
 
-# -------------------------
-# Training Loop
-# -------------------------
-
-
 def train_world_model_physics(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    normalization_std: torch.Tensor,
     num_epochs: int = 100,
     lr: float = 1e-3,
     device: str = "cpu",
@@ -162,22 +154,25 @@ def train_world_model_physics(
     scheduler_patience: int = 10,
     scheduler_factor: float = 0.5,
     scheduler_min_lr: float = 1e-6,
+    grad_clip: float = 1.0,
 ) -> Tuple[List[float], List[float]]:
     """
-    Train the physics-based world model.
+    Train the improved physics-based world model.
 
     Args:
         model: World model to train
         train_loader: Training data loader
         val_loader: Validation data loader
+        normalization_std: Standard deviation per dimension for normalized error metrics
         num_epochs: Number of training epochs
         lr: Learning rate
         device: Device to train on
-        acc_tol: Tolerance for accuracy computation (unused in loop, used in final eval)
+        acc_tol: Tolerance for accuracy computation
         cfrc_weight: Weight for contact force loss component
         scheduler_patience: Number of epochs with no improvement before reducing LR
         scheduler_factor: Factor by which to reduce LR
         scheduler_min_lr: Minimum learning rate
+        grad_clip: Gradient clipping threshold (0 to disable)
 
     Returns:
         Tuple of (train_losses, val_losses) for each epoch
@@ -187,34 +182,33 @@ def train_world_model_physics(
     train_losses: List[float] = []
     val_losses: List[float] = []
 
-    # Setup optimizer
-    num_params = sum(p.numel() for p in model.parameters())
-    print("\nTraining Configuration:")
-    print(f"  Device: {device}")
-    print(f"  Model parameters: {num_params:,}")
-    print(f"  Learning rate: {lr}")
-    print(f"  Epochs: {num_epochs}")
-    print(f"  Contact force weight: {cfrc_weight}")
-    print(
-        f"  LR Scheduler: ReduceLROnPlateau (patience={scheduler_patience}, factor={scheduler_factor}, min_lr={scheduler_min_lr})"
-    )
-
-    # Print initial parameter values if the model has the method
-    if hasattr(model, "print_learned_parameters"):
-        print("\nInitial Physical Parameters:")
-        model.print_learned_parameters()
-
+    # Setup optimizer (no weight decay for physics parameters)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Setup learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = optim.lr_scheduler.StepLR(
         optimizer,
-        mode="min",
-        factor=scheduler_factor,
-        patience=scheduler_patience,
-        min_lr=scheduler_min_lr,
+        step_size=5,
+        gamma=0.5,
         verbose=True,
     )
+
+    # Print configuration
+    num_params = sum(p.numel() for p in model.parameters())
+
+    print("\nTraining Configuration:")
+    print(f"  Device: {device}")
+    print(f"  Total parameters: {num_params:,}")
+    print(f"  Learning rate: {lr}")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Contact force weight: {cfrc_weight}")
+    print(f"  Gradient clipping: {grad_clip}")
+    print("  LR Scheduler: StepLR (step_size=5, gamma=0.5)")
+
+    # Print initial parameter values
+    if hasattr(model, "print_learned_parameters"):
+        print("\nInitial Physical Parameters:")
+        model.print_learned_parameters()
 
     # Training loop
     for epoch in range(num_epochs):
@@ -240,6 +234,11 @@ def train_world_model_physics(
             )
 
             loss.backward()
+
+            # Gradient clipping for stability
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.step()
 
             running_loss += float(loss.item())
@@ -273,8 +272,8 @@ def train_world_model_physics(
         avg_val_loss = val_running_loss / max(val_num_batches, 1)
         val_losses.append(avg_val_loss)
 
-        # Step the scheduler based on validation loss
-        scheduler.step(avg_val_loss)
+        # Step the scheduler
+        scheduler.step()
 
         # Periodic logging
         if (epoch + 1) % 10 == 0 or epoch == 0:
@@ -284,16 +283,87 @@ def train_world_model_physics(
             )
 
     # End-of-training evaluation with multiple tolerances
-    print("\nFinal Evaluation:")
-    tolerances = [0.2, 0.5, 1, 2]
-    for tol in tolerances:
-        train_mse, train_acc = evaluate_loader(model, train_loader, device, tol)
-        val_mse, val_acc = evaluate_loader(model, val_loader, device, tol)
+
+    # First, let's check what the actual normalized errors look like
+    print("\nDiagnosing normalized errors...")
+    model.eval()
+    with torch.no_grad():
+        # Get a sample batch to diagnose
+        sample_obs, sample_act, sample_next = next(iter(val_loader))
+        sample_obs = sample_obs.to(device)
+        sample_act = sample_act.to(device)
+        sample_next = sample_next.to(device)
+        sample_pred = model(sample_obs, sample_act)
+
+        abs_err = torch.abs(sample_pred - sample_next)
+        norm_std_device = normalization_std.to(device)
+
+        print(f"Sample batch size: {sample_obs.shape[0]}")
         print(
-            f"  Tolerance {tol:.3f}: Train acc={train_acc:.4f}, Val acc={val_acc:.4f}"
+            f"Normalization std device: {norm_std_device.device}, shape: {norm_std_device.shape}"
+        )
+        print(
+            f"Normalization std stats: min={norm_std_device.min().item():.6f}, max={norm_std_device.max().item():.6f}, mean={norm_std_device.mean().item():.6f}"
         )
 
-    # Print learned parameters if the model has the method
+        # Identify near-constant dimensions
+        min_std_threshold = 0.01
+        low_variance_dims = (norm_std_device < min_std_threshold).nonzero(
+            as_tuple=True
+        )[0]
+        if len(low_variance_dims) > 0:
+            print(
+                f"\nWARNING: {len(low_variance_dims)} dimensions have very low variance (std < {min_std_threshold}):"
+            )
+            for dim_idx in low_variance_dims[:10]:  # Show first 10
+                print(
+                    f"  Dim {dim_idx.item()}: std={norm_std_device[dim_idx].item():.8f}"
+                )
+            if len(low_variance_dims) > 10:
+                print(f"  ... and {len(low_variance_dims) - 10} more")
+            print(
+                f"These dimensions will use absolute error with threshold={min_std_threshold} for normalization."
+            )
+
+        # Use robust normalization (same as in compute_batch_accuracy)
+        robust_std = torch.maximum(
+            norm_std_device, torch.tensor(min_std_threshold, device=device)
+        )
+        normalized_err = abs_err / robust_std
+        mean_norm_err_per_sample = normalized_err.mean(dim=-1)
+
+        print(
+            f"\nAbsolute error stats: min={abs_err.min().item():.6f}, max={abs_err.max().item():.6f}, mean={abs_err.mean().item():.6f}"
+        )
+        print(
+            f"Robust normalized error stats: min={normalized_err.min().item():.6f}, max={normalized_err.max().item():.6f}, mean={normalized_err.mean().item():.6f}"
+        )
+        print(
+            f"Mean normalized error per sample stats: min={mean_norm_err_per_sample.min().item():.6f}, max={mean_norm_err_per_sample.max().item():.6f}, mean={mean_norm_err_per_sample.mean().item():.6f}"
+        )
+        print(
+            f"Number of samples with mean_norm_err <= 1.0: {(mean_norm_err_per_sample <= 1.0).sum().item()} / {len(mean_norm_err_per_sample)}"
+        )
+        print(
+            f"Number of samples with mean_norm_err <= 3.0: {(mean_norm_err_per_sample <= 3.0).sum().item()} / {len(mean_norm_err_per_sample)}"
+        )
+
+    print("\nFinal Evaluation:")
+    print("(Tolerance in units of standard deviations per dimension)")
+    # Tolerances are in units of standard deviations (normalized error)
+    tolerances = [0.5, 1.0, 1.5, 2.0, 3.0]
+    for tol in tolerances:
+        train_mse, train_acc = evaluate_loader(
+            model, train_loader, device, tol, normalization_std
+        )
+        val_mse, val_acc = evaluate_loader(
+            model, val_loader, device, tol, normalization_std
+        )
+        print(
+            f"  Tolerance {tol:.1f}σ: Train acc={train_acc:.4f}, Val acc={val_acc:.4f}"
+        )
+
+    # Print learned parameters
     if hasattr(model, "print_learned_parameters"):
         print("\nFinal Learned Physical Parameters:")
         model.print_learned_parameters()
@@ -301,25 +371,20 @@ def train_world_model_physics(
     return train_losses, val_losses
 
 
-# -------------------------
-# CLI
-# -------------------------
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a physics-informed world model (obs, action -> next_obs) from buffer data",
+        description="Train an improved physics-informed world model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train on a single buffer file
-  python MLP/train_world_model_physics.py --buffer_path path/to/buffer.pt
+  # Train on a single buffer file with default settings
+  python MLP/train_world_model_physics_improved.py --buffer_path path/to/buffer.pt
 
-  # Train on all buffers in a directory
-  python MLP/train_world_model_physics.py --buffer_paths path/to/buffer_dir
+  # Train with RK4 integration (recommended)
+  python MLP/train_world_model_physics_improved.py --buffer_path buffer.pt --use_rk4
 
-  # Custom physics hyperparams
-  python MLP/train_world_model_physics.py --buffer_path buffer.pt --dt 0.02 --no_residual --cfrc_weight 0.05
+  # Train with Euler integration (faster but less accurate)
+  python MLP/train_world_model_physics_improved.py --buffer_path buffer.pt --no_rk4
         """,
     )
 
@@ -341,43 +406,38 @@ Examples:
         "--epochs", type=int, default=100, help="Number of training epochs"
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-
     parser.add_argument(
-        "--device", type=str, default="auto", help="Device to use (auto, cpu, cuda)"
+        "--device", type=str, default="auto", help="Device (auto/cpu/cuda)"
     )
-
     parser.add_argument(
         "--save_model",
         type=str,
-        default="world_model_physics.pt",
+        default="world_model_physics_improved.pt",
         help="Path to save the trained model",
     )
-
     parser.add_argument(
         "--acc_tol",
         type=float,
         default=0.05,
-        help="Tolerance used to compute accuracy (fraction of samples with MAE per-dim <= tol)",
+        help="Tolerance for accuracy computation",
     )
 
-    # Physics-informed model hyperparameters
+    # Physics parameters
     parser.add_argument(
         "--dt", type=float, default=0.02, help="Integration timestep (s)"
     )
-    # Optional: adjust physical constants (world assumed known; defaults reasonable)
     parser.add_argument("--mass_cart", type=float, default=1.0)
     parser.add_argument("--mass_link1", type=float, default=0.1)
     parser.add_argument("--mass_link2", type=float, default=0.1)
     parser.add_argument("--length_link1", type=float, default=0.5)
-    # length_link2 removed - not used in physics calculations
     parser.add_argument("--com_link1", type=float, default=0.25)
     parser.add_argument("--com_link2", type=float, default=0.25)
     parser.add_argument("--inertia_link1", type=float, default=0.002)
     parser.add_argument("--inertia_link2", type=float, default=0.002)
     parser.add_argument("--gravity", type=float, default=9.81)
-    parser.add_argument("--cart_damping", type=float, default=0.0)
-    parser.add_argument("--joint1_damping", type=float, default=0.0)
-    parser.add_argument("--joint2_damping", type=float, default=0.0)
+    parser.add_argument("--cart_damping", type=float, default=0.1)
+    parser.add_argument("--joint1_damping", type=float, default=0.01)
+    parser.add_argument("--joint2_damping", type=float, default=0.01)
     parser.add_argument("--force_scale", type=float, default=1.0)
     parser.add_argument(
         "--cfrc_weight",
@@ -386,23 +446,50 @@ Examples:
         help="Weight for constraint force components in loss",
     )
 
+    # Model improvements
+    parser.add_argument(
+        "--use_rk4",
+        action="store_true",
+        default=True,
+        help="Use RK4 integration (default: True)",
+    )
+    parser.add_argument(
+        "--no_rk4",
+        action="store_false",
+        dest="use_rk4",
+        help="Use semi-implicit Euler instead of RK4",
+    )
+    parser.add_argument(
+        "--mass_matrix_reg",
+        type=float,
+        default=1e-4,
+        help="Regularization for mass matrix",
+    )
+
+    # Training hyperparameters
     parser.add_argument(
         "--scheduler_patience",
         type=int,
         default=10,
-        help="Number of epochs with no improvement before reducing LR",
+        help="Epochs with no improvement before reducing LR",
     )
     parser.add_argument(
         "--scheduler_factor",
         type=float,
         default=0.5,
-        help="Factor by which to reduce LR (new_lr = lr * factor)",
+        help="Factor to reduce LR",
     )
     parser.add_argument(
         "--scheduler_min_lr",
         type=float,
         default=1e-6,
         help="Minimum learning rate",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=1.0,
+        help="Gradient clipping threshold (0 to disable)",
     )
 
     args = parser.parse_args()
@@ -421,7 +508,6 @@ Examples:
     if args.buffer_path:
         buffer_data = load_single_buffer(args.buffer_path, device=str(device))
     else:
-        # If a single string provided in nargs+, it may be a directory
         if len(args.buffer_paths) == 1:
             buffer_data = load_multiple_buffers(
                 args.buffer_paths[0], device=str(device)
@@ -440,13 +526,12 @@ Examples:
     print(f"Observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
 
-    # The symbolic model is designed for InvertedDoublePendulum-v4: obs_dim=11, action_dim=1
     if obs_dim != 11 or action_dim != 1:
         raise ValueError(
-            f"WorldModelPhysicsSymbolic expects obs_dim=11 and action_dim=1, got obs_dim={obs_dim}, action_dim={action_dim}"
+            f"WorldModelPhysicsSymbolicImproved expects obs_dim=11 and action_dim=1, got obs_dim={obs_dim}, action_dim={action_dim}"
         )
 
-    model = WorldModelPhysicsSymbolic(
+    model = WorldModelPhysicsSymbolicImproved(
         obs_dim=obs_dim,
         action_dim=action_dim,
         dt=float(args.dt),
@@ -454,7 +539,6 @@ Examples:
         mass_link1=float(args.mass_link1),
         mass_link2=float(args.mass_link2),
         length_link1=float(args.length_link1),
-        # length_link2 removed - not used in physics
         com_link1=float(args.com_link1),
         com_link2=float(args.com_link2),
         inertia_link1=float(args.inertia_link1),
@@ -464,42 +548,34 @@ Examples:
         joint1_damping=float(args.joint1_damping),
         joint2_damping=float(args.joint2_damping),
         force_scale=float(args.force_scale),
+        use_rk4=args.use_rk4,
+        mass_matrix_reg=args.mass_matrix_reg,
     )
+
+    print("\nModel Configuration:")
+    print(f"  Use RK4 integration: {args.use_rk4}")
+    print(f"  Mass matrix regularization: {args.mass_matrix_reg}")
 
     # Dataloaders
     train_loader, val_loader = create_dataloaders(
         obs_tensor, action_tensor, next_obs_tensor, batch_size=args.batch_size
     )
 
-    # Peek at sample data to verify inputs
-    def print_sample_from_loader(name: str, loader: DataLoader):
-        """Print a sample batch from the loader for verification."""
-        try:
-            batch = next(iter(loader))
-        except StopIteration:
-            print(f"{name}: loader is empty")
-            return
-        obs_b, act_b, next_b = batch
-        print(f"\n{name} Sample:")
-        print(
-            f"  Batch shapes: obs={tuple(obs_b.shape)}, act={tuple(act_b.shape)}, next={tuple(next_b.shape)}"
-        )
-        k = min(2, obs_b.shape[0])
-        print(f"  First {k} obs:\n{obs_b[:k].detach().cpu()}")
-        print(f"  First {k} act:\n{act_b[:k].detach().cpu()}")
-        print(f"  First {k} next:\n{next_b[:k].detach().cpu()}")
-
-    print_sample_from_loader("Train", train_loader)
-    print_sample_from_loader("Val", val_loader)
+    # Compute normalization statistics for fair comparison across dimensions
+    normalization_std = next_obs_tensor.std(dim=0).to(device)
+    print("\nNormalization std per dimension:")
+    for i, std_val in enumerate(normalization_std.cpu().numpy()):
+        print(f"  Dim {i}: {std_val:.6f}")
 
     # Train
     print("\n" + "=" * 60)
-    print("Starting Physics World Model Training")
+    print("Starting Improved Physics World Model Training")
     print("=" * 60)
     train_losses, val_losses = train_world_model_physics(
         model,
         train_loader,
         val_loader,
+        normalization_std,
         num_epochs=args.epochs,
         lr=args.lr,
         device=str(device),
@@ -508,6 +584,7 @@ Examples:
         scheduler_patience=args.scheduler_patience,
         scheduler_factor=args.scheduler_factor,
         scheduler_min_lr=args.scheduler_min_lr,
+        grad_clip=args.grad_clip,
     )
 
     # Save checkpoint
@@ -515,24 +592,21 @@ Examples:
     print("Saving Model")
     print("=" * 60)
 
-    # Get learned parameters if available
     learned_params = {}
     if hasattr(model, "get_learned_parameters"):
         learned_params = model.get_learned_parameters()
 
     ckpt = {
         "model_state_dict": model.state_dict(),
-        "model_class": "WorldModelPhysicsSymbolic",
+        "model_class": "WorldModelPhysicsSymbolicImproved",
         "obs_dim": obs_dim,
         "action_dim": action_dim,
-        # Initial physics parameters (from command line)
         "initial_params": {
             "dt": float(args.dt),
             "mass_cart": float(args.mass_cart),
             "mass_link1": float(args.mass_link1),
             "mass_link2": float(args.mass_link2),
             "length_link1": float(args.length_link1),
-            # length_link2 removed - not used in physics
             "com_link1": float(args.com_link1),
             "com_link2": float(args.com_link2),
             "inertia_link1": float(args.inertia_link1),
@@ -543,16 +617,22 @@ Examples:
             "joint2_damping": float(args.joint2_damping),
             "force_scale": float(args.force_scale),
         },
-        # Learned physics parameters (after training)
         "learned_params": learned_params,
-        # Training parameters
-        "dt": float(args.dt),
-        "cfrc_weight": float(args.cfrc_weight),
+        "model_config": {
+            "use_rk4": args.use_rk4,
+            "mass_matrix_reg": args.mass_matrix_reg,
+        },
+        "training_config": {
+            "dt": float(args.dt),
+            "cfrc_weight": float(args.cfrc_weight),
+            "lr": args.lr,
+            "grad_clip": args.grad_clip,
+        },
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "normalization_std": normalization_std.cpu(),  # Save for future evaluation
     }
 
-    # Save buffer paths for reference
     if args.buffer_path:
         ckpt["buffer_path"] = args.buffer_path
     else:
@@ -571,30 +651,34 @@ Examples:
         print("\nParameter Learning Summary (Initial → Learned):")
         print("=" * 60)
         initial = ckpt["initial_params"]
-        for key in [
-            "mass_cart",
-            "mass_link1",
-            "mass_link2",
-            "length_link1",
-            "com_link1",
-            "com_link2",
-            "inertia_link1",
-            "inertia_link2",
-            "gravity",
-            "cart_damping",
-            "joint1_damping",
-            "joint2_damping",
-            "force_scale",
-        ]:
-            init_val = initial[key]
-            learned_val = learned_params[key]
+
+        # Map between initial_params keys and learned_params keys
+        key_mapping = {
+            "mass_cart": "m_c",
+            "mass_link1": "m1",
+            "mass_link2": "m2",
+            "length_link1": "l1",
+            "com_link1": "lc1",
+            "com_link2": "lc2",
+            "inertia_link1": "I1",
+            "inertia_link2": "I2",
+            "gravity": "g",
+            "cart_damping": "b_x",
+            "joint1_damping": "b1",
+            "joint2_damping": "b2",
+            "force_scale": "force_scale",
+        }
+
+        for init_key, learned_key in key_mapping.items():
+            init_val = initial[init_key]
+            learned_val = learned_params[learned_key]
             change_pct = (
                 ((learned_val - init_val) / init_val * 100)
                 if init_val != 0
                 else float("inf")
             )
             print(
-                f"  {key:20s}: {init_val:10.6f} → {learned_val:10.6f} ({change_pct:+7.2f}%)"
+                f"  {init_key:20s}: {init_val:10.6f} → {learned_val:10.6f} ({change_pct:+7.2f}%)"
             )
 
     print("=" * 60)
